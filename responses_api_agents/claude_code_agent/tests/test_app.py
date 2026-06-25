@@ -235,6 +235,43 @@ class TestRunClaudeCode:
         assert model == "claude-sonnet-4-6"
 
 
+class TestRolloutCorrelation:
+    """The CLI streams /v1/messages, so correlation rides on the ANTHROPIC_BASE_URL path prefix
+    (headers can't be injected into the sandboxed CLI). These assert the prefix wiring."""
+
+    def _fake_proc(self):
+        class FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return b'{"type":"result","usage":{"input_tokens":1,"output_tokens":1}}\n', b""
+
+        return FakeProc()
+
+    def _run_and_capture_base_url(self, agent, tmp_path: Path, **run_kwargs) -> str | None:
+        captured: dict = {}
+
+        async def fake_exec(*cmd, **kwargs):
+            captured["base_url"] = kwargs["env"].get("ANTHROPIC_BASE_URL")
+            return self._fake_proc()
+
+        with (
+            patch("responses_api_agents.claude_code_agent.app.Path.home", return_value=tmp_path),
+            patch.object(agent, "_resolve_base_url", return_value="http://model-server:9000"),
+            patch("responses_api_agents.claude_code_agent.app.asyncio.create_subprocess_exec", fake_exec),
+        ):
+            asyncio.run(agent._run_claude_code("hi", **run_kwargs))
+        return captured["base_url"]
+
+    def test_rollout_prefix_applied_to_base_url(self, tmp_path: Path) -> None:
+        base_url = self._run_and_capture_base_url(_make_agent(), tmp_path, rollout_id="task3-roll1")
+        # CLI appends /v1/messages -> server strips /ng-rollout/<id> and keys capture by it.
+        assert base_url == "http://model-server:9000/ng-rollout/task3-roll1"
+
+    def test_no_rollout_id_leaves_base_url_unprefixed(self, tmp_path: Path) -> None:
+        assert self._run_and_capture_base_url(_make_agent(), tmp_path) == "http://model-server:9000"
+
+
 class TestExtractInstruction:
     def test_user_only(self) -> None:
         items = [NeMoGymEasyInputMessage(role="user", content="hello")]

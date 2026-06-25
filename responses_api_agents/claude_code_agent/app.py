@@ -48,7 +48,7 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseOutputTokensDetails,
     NeMoGymResponseUsage,
 )
-from nemo_gym.server_utils import get_response_json, raise_for_status
+from nemo_gym.server_utils import ROLLOUT_HEADER, apply_rollout_prefix, get_response_json, raise_for_status
 from responses_api_agents.claude_code_agent.setup_claude_code import ensure_claude_code
 
 
@@ -327,9 +327,17 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
         cmd += ["--", instruction]
         return cmd
 
-    async def _run_claude_code(self, instruction: str, system_prompt: Optional[str] = None) -> tuple[str, str]:
-        """Run claude -p --output-format=stream-json and return (stdout, model_name)."""
+    async def _run_claude_code(
+        self, instruction: str, system_prompt: Optional[str] = None, rollout_id: Optional[str] = None
+    ) -> tuple[str, str]:
+        """Run claude -p --output-format=stream-json and return (stdout, model_name).
+
+        When ``rollout_id`` is set and a model server is configured, the per-rollout capture prefix is
+        applied to ANTHROPIC_BASE_URL so the CLI's streaming /v1/messages calls correlate to this rollout.
+        """
         base_url = self._resolve_base_url()
+        if base_url:
+            base_url = apply_rollout_prefix(base_url, rollout_id)
         # Keep full model name for local/custom endpoints; strip provider prefix for real Anthropic API.
         model = self.config.model if base_url else self.config.model.split("/")[-1]
         api_key = self.config.anthropic_api_key
@@ -388,7 +396,10 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
         system_parts = [p for p in [self.config.system_prompt, input_system] if p]
         system_prompt = "\n\n".join(system_parts) if system_parts else None
 
-        stdout, model_name = await self._run_claude_code(user_message, system_prompt=system_prompt)
+        rollout_id = request.headers.get(ROLLOUT_HEADER)
+        stdout, model_name = await self._run_claude_code(
+            user_message, system_prompt=system_prompt, rollout_id=rollout_id
+        )
         output_items, usage = parse_stream_json(stdout)
 
         if not any(
@@ -445,6 +456,7 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
                 url_path="/v1/responses",
                 json=body.responses_create_params,
                 cookies=cookies,
+                **self.rollout_call_kwargs(body),
             )
             await raise_for_status(agent_resp)
             cookies = agent_resp.cookies
